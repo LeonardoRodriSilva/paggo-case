@@ -1,0 +1,53 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db" 
+}
+
+enum DocumentStatus {
+  PENDING    
+  PROCESSING  
+  COMPLETED   
+  FAILED      
+}
+
+enum MessageSender {
+  USER 
+  AI   
+}
+
+model Document {
+  id               Int            @id @default(autoincrement()) 
+  originalFilename String         
+  storagePath      String         @unique
+  mimeType         String
+  size              Int         
+  extractedText    String?       
+  status           DocumentStatus @default(PENDING) 
+  createdAt        DateTime       @default(now()) 
+  updatedAt        DateTime       @updatedAt      
+
+  chatMessages ChatMessage[]
+}
+
+model ChatMessage {
+  id        Int           @id @default(autoincrement()) 
+  content   String        
+  sender    MessageSender 
+  createdAt DateTime      @default(now()) 
+
+  
+  documentId Int         
+  document   Document    @relation(fields: [documentId], references: [id], onDelete: Cascade) 
+
+  @@index([documentId])
+}
+
+// Tabela User será adicionada futuramente se necessário
+// model User { ... }
