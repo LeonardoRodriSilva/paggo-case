@@ -2,92 +2,137 @@ import {
   Controller,
   Get,
   Post,
-  Body,
   Param,
-  Delete,
-  UseInterceptors,
-  UploadedFile,
   ParseIntPipe,
+  HttpException,
+  HttpStatus,
+  Body,
+  NotFoundException,
+  InternalServerErrorException,
   Logger,
 } from '@nestjs/common';
-import { FileInterceptor } from '@nestjs/platform-express'; // Importar
-import { diskStorage } from 'multer'; // Importar para configurar armazenamento
-import { extname } from 'path'; // Importar para pegar extensão do arquivo
 import { DocumentService } from './document.service';
-import { CreateDocumentDto } from './dto/create-document.dto';
-import { UpdateDocumentDto } from './dto/update-document.dto';
+import { AiService } from '../ai/ai.service';
+import { CreateChatDto } from './dto/create-chat-dto';
+import { DocumentStatus } from '@prisma/client'; // Importar o Enum se não estiver global
 
-@Controller('document')
+@Controller('documents')
 export class DocumentController {
   private readonly logger = new Logger(DocumentController.name);
 
-  constructor(private readonly documentService: DocumentService) {}
-
-  // --- MODIFICAÇÃO AQUI ---
-  @Post()
-  @UseInterceptors(
-    FileInterceptor('file', {
-      // 1. Usar FileInterceptor
-      storage: diskStorage({
-        // 2. Configurar onde e como salvar
-        destination: './uploads', // 3. Salvar na pasta 'uploads'
-        filename: (req, file, cb) => {
-          // 4. Definir nome do arquivo salvo
-          // Gere um nome único para evitar conflitos
-          const randomName = Array(32)
-            .fill(null)
-            .map(() => Math.round(Math.random() * 16).toString(16))
-            .join('');
-          // Use a extensão original do arquivo
-          return cb(null, `${randomName}${extname(file.originalname)}`);
-        },
-      }),
-      // Opcional: Adicionar validações de tamanho/tipo aqui se necessário
-      // fileFilter: (req, file, cb) => { ... }
-      // limits: { fileSize: 1024 * 1024 * 5 } // Ex: Limite de 5MB
-    }),
-  )
-  // 5. Injetar o arquivo com @UploadedFile e o DTO com @Body
-  create(
-    @UploadedFile() file: Express.Multer.File,
-    // O DTO agora pode não ser mais necessário no Body,
-    // pois pegaremos os dados do 'file'.
-    // Remova @Body() se o frontend não enviar mais um JSON separado.
-    // @Body() createDocumentDto: CreateDocumentDto
-  ) {
-    this.logger.log(
-      `Received file: ${file.originalname}, size: ${file.size}, mimetype: ${file.mimetype}`,
-    );
-    this.logger.log(`File saved to: ${file.path}`); // Caminho onde foi salvo
-
-    // 6. Criar o DTO a partir dos dados do arquivo recebido
-    const createDocumentData: CreateDocumentDto = {
-      originalFilename: file.originalname,
-      storagePath: file.path, // Usar o caminho onde o multer salvou
-      mimeType: file.mimetype,
-      size: file.size,
-    };
-
-    // 7. Chamar o serviço com os dados extraídos do arquivo
-    return this.documentService.create(createDocumentData);
-  }
-  // --- FIM DA MODIFICAÇÃO ---
+  constructor(
+    private readonly documentService: DocumentService,
+    private readonly aiService: AiService,
+  ) {}
 
   @Get()
-  findAll() {
+  async findAll() {
     return this.documentService.findAll();
   }
 
   @Get(':id')
-  findOne(@Param('id', ParseIntPipe) id: number) {
-    // Adicionado ParseIntPipe para validação/conversão
-    return this.documentService.findOne(id);
+  async findOne(@Param('id', ParseIntPipe) id: number) {
+    const document = await this.documentService.findOne(id);
+    if (!document) {
+      throw new NotFoundException(`Document with ID ${id} not found.`);
+    }
+    return document;
   }
 
-  // O método update precisaria de lógica similar para upload se fosse atualizar o arquivo
-  @Delete(':id')
-  remove(@Param('id', ParseIntPipe) id: number) {
-    // Adicionado ParseIntPipe
-    return this.documentService.remove(id);
+  @Post(':id/chat')
+  async getDocumentExplanation(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() createChatDto: CreateChatDto,
+  ) {
+    this.logger.log(`Received chat request for document ID: ${id}`);
+    // O DTO e o ValidationPipe garantem que 'prompt' é string e não vazio aqui
+    const { question } = createChatDto;
+
+    try {
+      const document = await this.documentService.findOne(id);
+      if (!document) {
+        throw new NotFoundException(`Document with ID ${id} not found.`);
+      }
+
+      // Usar o Enum importado para comparação mais segura
+      if (document.status !== DocumentStatus.COMPLETED) {
+        throw new HttpException(
+          `Document ${id} is not yet processed. Status: ${document.status}`,
+          HttpStatus.BAD_REQUEST,
+        );
+      }
+      if (!document.extractedText) {
+        this.logger.error(
+          `Document ${id} is COMPLETED but has no extractedText.`,
+        );
+        throw new InternalServerErrorException(
+          `Document ${id} is marked as completed, but extracted text is missing.`,
+        );
+      }
+
+      this.logger.log(
+        `Sending text (length: ${document.extractedText.length}) and prompt to AI Service.`,
+      );
+
+      // Chamada ao AiService - o tipo de retorno é Promise<string | null>
+      const explanation: string | null = await this.aiService.createChatCompletion(
+        question,
+        document.extractedText,
+      );
+
+      // Verificação mais segura para null ou string de erro específica
+      if (explanation === null) {
+        this.logger.warn(
+          `AI Service returned null explanation for document ${id}`,
+        );
+        throw new InternalServerErrorException(
+          'Failed to get explanation from AI service.',
+        );
+      }
+      // Verificar explicitamente se é uma string antes de usar métodos de string
+      if (
+        typeof explanation === 'string' &&
+        explanation.startsWith('Desculpe, ocorreu um erro')
+      ) {
+        throw new InternalServerErrorException(explanation);
+      }
+      // Se chegou aqui e é uma string, é a resposta válida
+      if (typeof explanation === 'string') {
+        this.logger.log(`Successfully received explanation for document ${id}`);
+        return { response: explanation };
+      } else {
+        // Caso inesperado se explanation não for string nem null nem a string de erro
+        this.logger.error(
+          `Unexpected type received from AI Service: ${typeof explanation}`,
+        );
+        throw new InternalServerErrorException(
+          'Received an unexpected response format from AI service.',
+        );
+      }
+    } catch (error) {
+      if (error instanceof HttpException) {
+        // Se já for uma HttpException conhecida (NotFound, BadRequest, InternalServer...), apenas relance
+        throw error;
+      } else if (error instanceof Error) {
+        // Se for um Error padrão, logue a mensagem e stack e lance um InternalServerError
+        this.logger.error(
+          `Error during chat request for document ${id}: ${error.message}`,
+          error.stack,
+        );
+        throw new InternalServerErrorException(
+          `An unexpected error occurred: ${error.message}`,
+        );
+      } else {
+        // Para outros tipos de erros (embora menos comum em JS/TS)
+        this.logger.error(
+          `Unknown error type during chat request for document ${id}: ${JSON.stringify(error)}`,
+        );
+        throw new InternalServerErrorException('An unexpected error occurred.');
+      }
+    }
   }
+
+  // Seu endpoint de upload...
+  // @Post('upload')
+  // ...
 }
